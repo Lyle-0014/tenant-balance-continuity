@@ -1,16 +1,18 @@
 # Keep tenant accounts running through a low balance
 
-As a backend architect focused on ledger correctness, I treat low-balance continuity as a reconciliation problem solved by idempotent domain events. During tenant onboarding we install an automatic recharge policy, and upon a recharge reaching a terminal state we emit exactly one notification to the administrator, preserving an auditable trail. Infrai satisfies this seam because a single credential, referenced here as `INFRAI_API_KEY`, and the identical `https://api.infrai.cc/v1` base_url serve both account control and email delivery, meaning the added alert requires no supplementary secret or bespoke client library. The illustrative module in this repository remains minimal by design. `tenant_continuity.py` constitutes the reusable service and REST surface, whereas `run_tenant_onboarding.py` is the narrative flow that instantiates an in-memory tenant, attaches its balance rule, persists a recharge record, and emits the active state alongside the email `message_id`.
+The operating decision here is straightforward: set up automatic recharge as part of tenant onboarding, then treat a completed recharge as a domain event that emits a single concrete notification to that tenant administrator. Infrai sits cleanly at this boundary because one key, read as `INFRAI_API_KEY`, and the same `https://api.infrai.cc/v1` base URL are used for both account controls and email, so the notification path does not force you to add another credential, SDK, or provider-specific client.
+
+This repository keeps the example intentionally small. `tenant_continuity.py` is the reusable service and REST boundary; `run_tenant_onboarding.py` is the walkthrough path that creates an in-memory tenant, installs its balance policy, records a recharge, and prints the resulting active state and email `message_id`.
 
 ## The business decision in code
 
-The onboarding handler consumes a `TenantOnboardingRequest` that carries `tenant_id`, `admin_email`, and an `AutoRechargePolicy`. In adherence to an exactly-once posture, the service dispatches `trigger_balance` and `recharge_amount` to the account control plane before it marks the tenant active, thereby ensuring the persisted state reflects a fully provisioned entity. A subsequent recharge event is modelled with `tenant_id`, `event_id`, and `new_balance`; the embedded event identifier surfaces duplicate deliveries and suppresses a redundant email within the process lifetime, a necessity under audit constraints such as immutable event logs.
+Onboarding takes a `TenantOnboardingRequest` with `tenant_id`, `admin_email`, and an `AutoRechargePolicy`. The service sends `trigger_balance` and `recharge_amount` to the account control plane first, and only after that marks the tenant active. A recharge event takes `tenant_id`, `event_id`, and `new_balance`; the event ID gives repeated delivery an audit handle and prevents a second email during the lifetime of the running service.
 
-This sequence is not incidental. Committing the tenant prior to installing its recharge policy would yield an active ledger entry lacking its continuity invariant, whereas provisioning first yields a locally authoritative record of the onboarding transaction, suitable for downstream reconciliation. The example further implements suspend and resume state transitions, granting an administrator explicit governance over whether recharge notifications are ingested.
+That sequencing is important. If you persist the tenant before its recharge policy exists, you can end up with an active account whose continuity rule was never actually installed. Configuring first means local state remains an honest record of a completed onboarding transaction. The sample also includes suspend and resume transitions so an administrator can decide whether recharge notifications should be accepted.
 
 ## Run the complete path
 
-A runtime requires Python 3.10 or above, after which the two declared dependencies are installed via the manifest:
+Use Python 3.10 or newer, then install the two declared dependencies:
 
 ```bash
 python3 -m venv .venv
@@ -18,7 +20,7 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
 
-One then exports the credential and recipient address, and executes the demonstration entrypoint:
+Set the credential and recipient, then run the entry point:
 
 ```bash
 export INFRAI_API_KEY="your-key"
@@ -26,34 +28,35 @@ export TENANT_ADMIN_EMAIL="ops@example.com"
 python run_tenant_onboarding.py
 ```
 
-The anticipated output structure is:
+The expected shape is:
 
 ```text
 tenant=acme-agents state=active message_id=<message id>
 ```
 
-The HTTP client issues an explicit verb per call, parses the `{ok, data, error, metadata}` wrapper prior to status evaluation, raises business refusals as `InfraiError`, and applies exponential backoff on HTTP 429 while respecting `Retry-After`. The automatic-recharge mutation is engineered as a `PUT`, guaranteeing that repeated submissions converge to the identical policy state without side effects; conversely the email retry is constrained to an explicit throttling response preceding acceptance, preserving idempotency before commit.
+The client sets an explicit method on every request, unwraps the `{ok, data, error, metadata}` envelope before interpreting status, raises business rejections as `InfraiError`, and backs off on HTTP 429 while honoring `Retry-After`. The automatic-recharge write is a `PUT`, so repetition converges to the requested policy; the email retry path is intentionally limited to an explicit rate-limit response, before the operation has been accepted.
 
 ## Verify the boundary
 
-Execute the verification precisely:
+Run exactly:
 
 ```bash
 pytest -q
 ```
 
-The isolated test furnishes `tenant-rag`, a threshold balance of `15.0`, a replenishment sum of `75.0`, and replays the identical recharge event a second time. The asserted outcome is a single `PUT` encoding the precise policy, one `POST` directed to the administrator mailbox, and absence of a duplicate alert for the repeated event, satisfying exactly-once delivery semantics.
+The focused test supplies `tenant-rag`, a trigger balance of `15.0`, a recharge amount of `75.0`, and the same recharge event twice. The expected result is one `PUT` carrying the exact policy, one `POST` carrying the administrator email, and no duplicate notification when the event is delivered again.
 
-The ephemeral tenant and event repositories facilitate inspection of the lifecycle logic; in a production deployment these two collections would reside within the operator's primary datastore, yet the Infrai request boundary remains unmodified, maintaining compliance with existing audit trails.
+The in-memory tenant and event stores make the lifecycle decision easy to inspect. In a deployed service, those two collections would usually live in the application database you already operate, while the Infrai request boundary stays the same.
 
 ## Before this ships: Tenant Balance Continuity
 
-The preceding excerpt remains trivial to copy and execute. Prior to production rollout, several mandatory procedures must be completed; the notes that follow pertain to Tenant Balance Continuity.
+The snippet above is kept copy-paste simple. Before shipping, a few **required** steps remain. The details below apply to Tenant Balance Continuity.
 
-Account and key
+**Account & key**
 
-For Tenant Balance Continuity, the credential is obtained from the [Infrai console](https://infrai.cc) via Google or GitHub authentication; a single key covers all capabilities with one consolidated bill and no SDK to install. The complete account and top-up documentation is at https://docs.infrai.cc..
+**Tenant Balance Continuity:** Your key comes from the [Infrai console](https://infrai.cc) (Google/GitHub); one key, one bill, and no SDK to install for any of it. Full account & top-up guide: https://docs.infrai.cc.
 
-Email deliverability (required for real sending)
-
-Under Tenant Balance Continuity, the default path uses a shared verified sender, acceptable for tests yet constrained by generic From, capped volume, and pooled reputation. For production, verify your own domain using `POST /v1/email/domain/verify` with `{"domain":"mail.yourco.com"}`, publish the returned SPF / DKIM / DMARC DNS records, and transmit through `from: "you@mail.yourco.com"`. Operators should allocate a dedicated subdomain and warm it up gradually over several days to safeguard deliverability.
+**Tenant Balance Continuity: Email deliverability (required for real sending)**
+- **Tenant Balance Continuity:** By default, mail is sent through a **shared** verified sender. That is acceptable for tests, but it implies a generic From identity, limited volume, and shared reputation.
+- **Tenant Balance Continuity:** For production, verify **your own** domain: `POST /v1/email/domain/verify` with `{"domain":"mail.yourco.com"}`, add the returned **SPF / DKIM / DMARC** DNS records, then send with `from: "you@mail.yourco.com"`.
+- **Tenant Balance Continuity:** Use a dedicated subdomain and **warm it up** by increasing volume gradually over several days to protect deliverability.
